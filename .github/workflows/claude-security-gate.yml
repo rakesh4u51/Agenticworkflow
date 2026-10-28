@@ -155,92 +155,61 @@ jobs:
           echo "  - Total:         $TOTAL"
         continue-on-error: true
 
-      # ── Step 9: Run Claude Code headless PCI DSS analysis ─────────────────
-      - name: "🤖 Claude Code: PCI DSS violation analysis"
+      # ── Step 9: Run PCI DSS analysis via OpenRouter API ──────────────────
+      - name: "🤖 Claude: PCI DSS violation analysis"
         if: steps.changed-files.outputs.no_python_changes == 'false'
         id: claude-pci-check
         run: |
           mkdir -p ci_reports
-          
-          # Create the diff file for Claude Code to analyze
           git diff origin/${{ github.base_ref }}...HEAD -- '*.py' > ci_reports/pr_diff.patch
-          
-          # Prepare the PCI DSS analysis prompt
-          PCI_PROMPT="You are a PCI DSS compliance specialist reviewing a pull request for a banking platform.
-          
-          Analyze the following git diff for PCI DSS violations. Focus on:
-          1. Plaintext cardholder data in logs or outputs (PCI DSS Req 3)
-          2. Hardcoded credentials, API keys, or passwords (PCI DSS Req 6)
-          3. Missing authentication on banking API endpoints (PCI DSS Req 8)
-          4. Insufficient audit logging for financial operations (PCI DSS Req 10)
-          5. Input validation gaps that could allow SQL injection or command injection (PCI DSS Req 6)
-          6. Unencrypted transmission of sensitive data (PCI DSS Req 4)
-          
-          Provide a structured JSON response with:
-          {
-            \"pci_dss_violations\": [
-              {
-                \"severity\": \"CRITICAL|HIGH|MEDIUM|LOW\",
-                \"requirement\": \"PCI DSS Req X.X\",
-                \"description\": \"Description of violation\",
-                \"file\": \"filename\",
-                \"line_reference\": \"approximate line or code snippet\",
-                \"remediation\": \"How to fix\"
-              }
-            ],
-            \"overall_pci_status\": \"PASS|FAIL\",
-            \"critical_high_count\": 0,
-            \"summary\": \"Brief summary\"
-          }
-          
-          DIFF TO ANALYZE:
-          $(cat ci_reports/pr_diff.patch | head -500)
-          
-          Respond with ONLY valid JSON, no other text."
-          
-          # Run Claude Code in headless mode
-          CLAUDE_RAW=$(claude \
-            --output-format json \
-            -p "$PCI_PROMPT" \
-            2>/dev/null) || true
 
-          # Claude Code 2.x: result is in top-level "result" key
-          echo "$CLAUDE_RAW" | python3 -c "
-          import sys, json
-          raw = sys.stdin.read().strip()
-          result_text = ''
+          python3 << 'PYEOF'
+          import json, os, re, urllib.request
+          with open('ci_reports/pr_diff.patch') as f:
+              diff = f.read()[:6000]
+          prompt = (
+              "You are a PCI DSS compliance specialist reviewing a pull request for a banking platform.\n\n"
+              "Analyze the following git diff for PCI DSS violations. Focus on:\n"
+              "1. Plaintext cardholder data in logs or outputs (PCI DSS Req 3)\n"
+              "2. Hardcoded credentials, API keys, or passwords (PCI DSS Req 6)\n"
+              "3. Missing authentication on banking API endpoints (PCI DSS Req 8)\n"
+              "4. Insufficient audit logging for financial operations (PCI DSS Req 10)\n"
+              "5. Input validation gaps (PCI DSS Req 6)\n"
+              "6. Unencrypted transmission of sensitive data (PCI DSS Req 4)\n\n"
+              "Respond with ONLY this JSON:\n"
+              '{"pci_dss_violations":[],"overall_pci_status":"PASS|FAIL","critical_high_count":0,"summary":"text"}\n\n'
+              "DIFF:\n" + diff
+          )
+          payload = json.dumps({
+              "model": "anthropic/claude-sonnet-4-5",
+              "messages": [{"role": "user", "content": prompt}],
+              "max_tokens": 1000
+          }).encode()
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
+                  "Content-Type": "application/json",
+              },
+              method="POST"
+          )
           try:
-              outer = json.loads(raw)
-              # Claude Code 2.x wraps response in 'result' key
-              result_text = outer.get('result', '')
-              if not result_text:
-                  # fallback: stream-json assistant event
-                  for line in raw.splitlines():
-                      try:
-                          ev = json.loads(line)
-                          if ev.get('type') == 'assistant':
-                              for blk in ev.get('message', {}).get('content', []):
-                                  if blk.get('type') == 'text':
-                                      result_text += blk.get('text', '')
-                          elif ev.get('type') == 'result':
-                              result_text = ev.get('result', result_text)
-                      except Exception:
-                          continue
-          except Exception:
-              pass
-          print(result_text)
-          " > ci_reports/claude_pci_analysis.json 2>/dev/null
-
-          # Ensure valid fallback if empty/unparseable
-          python3 -c "
-          import json, sys
+              with urllib.request.urlopen(req, timeout=90) as resp:
+                  data = json.loads(resp.read())
+                  text = data["choices"][0]["message"]["content"]
+                  m = re.search(r'\{.*\}', text, re.DOTALL)
+                  result = m.group() if m else text
+          except Exception as e:
+              result = json.dumps({"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": str(e)})
+          with open('ci_reports/claude_pci_analysis.json', 'w') as f:
+              f.write(result)
           try:
-              with open('ci_reports/claude_pci_analysis.json') as f:
-                  json.load(f)
+              json.loads(result)
           except Exception:
               with open('ci_reports/claude_pci_analysis.json', 'w') as f:
-                  json.dump({'overall_pci_status': 'ERROR', 'critical_high_count': 0, 'summary': 'Claude Code analysis failed'}, f)
-          " 2>/dev/null || echo '{"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": "Claude Code analysis failed"}' > ci_reports/claude_pci_analysis.json
+                  json.dump({"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": "parse error"}, f)
+          PYEOF
           
           # Extract key metrics
           PCI_STATUS=$(python3 -c "
@@ -362,110 +331,62 @@ jobs:
           echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
           echo "📊 PR diff: $DIFF_LINES lines"
 
-      # ── Step 6: Claude-as-Judge compliance scoring ────────────────────────
+      # ── Step 6: Claude-as-Judge compliance scoring via OpenRouter API ────
       - name: "🏛️ Claude-as-Judge: Score compliance quality"
         id: compliance-judge
         run: |
           mkdir -p ci_reports
-          
-          # The Claude-as-Judge rubric for BFSI banking platform compliance
-          JUDGE_PROMPT="You are a senior banking compliance officer acting as a code review judge.
-          
-          Score this pull request on a 1-5 compliance quality rubric for a PCI DSS-regulated banking platform.
-          
-          SCORING RUBRIC:
-          
-          5/5 - EXCELLENT:
-          - All sensitive data properly masked/encrypted
-          - Complete audit logging for all financial operations  
-          - Input validation on all user-provided data
-          - No hardcoded credentials or secrets
-          - Proper error handling without information leakage
-          - Code follows all CLAUDE.md PCI DSS standards
-          
-          4/5 - GOOD (MEETS GATE THRESHOLD):
-          - Sensitive data handling is correct
-          - Audit logging present for key operations
-          - Minor improvements possible but no compliance risks
-          - Follows most PCI DSS standards from CLAUDE.md
-          
-          3/5 - ADEQUATE (BELOW THRESHOLD — GATE FAILS):
-          - Some gaps in data protection
-          - Incomplete audit trail
-          - Some missing input validation
-          - Needs remediation before merging
-          
-          2/5 - POOR (GATE FAILS):
-          - Significant compliance gaps
-          - Missing required security controls
-          - High risk of PCI DSS violation in production
-          
-          1/5 - CRITICAL FAILURE (GATE FAILS):
-          - Active PCI DSS violations
-          - Data exposed or security controls bypassed
-          - Must not be merged under any circumstances
-          
-          PULL REQUEST METADATA:
-          - PR #${{ github.event.pull_request.number }}
-          - Title: ${{ github.event.pull_request.title }}
-          - Author: ${{ github.event.pull_request.user.login }}
-          
-          CODE CHANGES TO REVIEW:
-          $(cat ci_reports/full_diff.patch | head -400)
-          
-          Respond with ONLY this JSON structure, no other text:
-          {
-            \"score\": <integer 1-5>,
-            \"grade\": \"EXCELLENT|GOOD|ADEQUATE|POOR|CRITICAL_FAILURE\",
-            \"gate_decision\": \"PASS|FAIL\",
-            \"strengths\": [\"strength 1\", \"strength 2\"],
-            \"improvements_required\": [\"improvement 1\"],
-            \"improvements_suggested\": [\"suggestion 1\"],
-            \"pci_dss_notes\": \"Brief note on PCI DSS compliance\",
-            \"reviewer_summary\": \"2-3 sentence summary for PR author\"
-          }"
-          
-          # Run Claude-as-Judge in headless mode
-          CLAUDE_RAW=$(claude \
-            --output-format json \
-            -p "$JUDGE_PROMPT" \
-            2>/dev/null) || true
 
-          # Claude Code 2.x: response text lives in top-level "result" key
-          echo "$CLAUDE_RAW" | python3 -c "
-          import sys, json
-          raw = sys.stdin.read().strip()
-          result_text = ''
+          python3 << 'PYEOF'
+          import json, os, re, urllib.request
+          with open('ci_reports/full_diff.patch') as f:
+              diff = f.read()[:8000]
+          prompt = (
+              "You are a senior banking compliance officer acting as a code review judge.\n\n"
+              "Score this pull request on a 1-5 compliance quality rubric for a PCI DSS-regulated banking platform.\n\n"
+              "SCORING RUBRIC:\n"
+              "5/5 EXCELLENT: All sensitive data masked, complete audit logging, input validation, no hardcoded creds, proper error handling\n"
+              "4/5 GOOD (MEETS GATE): Sensitive data handling correct, audit logging present, follows most PCI DSS standards\n"
+              "3/5 ADEQUATE (GATE FAILS): Some data protection gaps, incomplete audit trail, missing input validation\n"
+              "2/5 POOR (GATE FAILS): Significant compliance gaps, missing security controls\n"
+              "1/5 CRITICAL FAILURE (GATE FAILS): Active PCI DSS violations, data exposed\n\n"
+              "CODE CHANGES TO REVIEW:\n" + diff + "\n\n"
+              "Respond with ONLY this JSON, no other text:\n"
+              '{"score":4,"grade":"GOOD","gate_decision":"PASS","strengths":["s1"],'
+              '"improvements_required":[],"improvements_suggested":[],'
+              '"pci_dss_notes":"note","reviewer_summary":"summary"}'
+          )
+          payload = json.dumps({
+              "model": "anthropic/claude-sonnet-4-5",
+              "messages": [{"role": "user", "content": prompt}],
+              "max_tokens": 1000
+          }).encode()
+          req = urllib.request.Request(
+              "https://openrouter.ai/api/v1/chat/completions",
+              data=payload,
+              headers={
+                  "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
+                  "Content-Type": "application/json",
+              },
+              method="POST"
+          )
           try:
-              outer = json.loads(raw)
-              result_text = outer.get('result', '')
-              if not result_text:
-                  for line in raw.splitlines():
-                      try:
-                          ev = json.loads(line)
-                          if ev.get('type') == 'assistant':
-                              for blk in ev.get('message', {}).get('content', []):
-                                  if blk.get('type') == 'text':
-                                      result_text += blk.get('text', '')
-                          elif ev.get('type') == 'result':
-                              result_text = ev.get('result', result_text)
-                      except Exception:
-                          continue
-          except Exception:
-              pass
-          print(result_text)
-          " > ci_reports/compliance_score.json 2>/dev/null
-
-          # Ensure valid JSON; fall back to error object if empty or unparseable
-          python3 -c "
-          import json
-          try:
-              with open('ci_reports/compliance_score.json') as f:
-                  json.load(f)
-          except Exception:
-              with open('ci_reports/compliance_score.json', 'w') as f:
-                  json.dump({'score': 0, 'grade': 'ERROR', 'gate_decision': 'FAIL', 'reviewer_summary': 'Scoring failed — manual review required'}, f)
-          " 2>/dev/null || echo '{"score": 0, "grade": "ERROR", "gate_decision": "FAIL", "reviewer_summary": "Scoring failed"}' > ci_reports/compliance_score.json
+              with urllib.request.urlopen(req, timeout=90) as resp:
+                  data = json.loads(resp.read())
+                  text = data["choices"][0]["message"]["content"]
+                  m = re.search(r'\{.*\}', text, re.DOTALL)
+                  result = m.group() if m else text
+                  json.loads(result)  # validate
+          except Exception as e:
+              result = json.dumps({
+                  "score": 0, "grade": "ERROR", "gate_decision": "FAIL",
+                  "strengths": [], "improvements_required": [],
+                  "improvements_suggested": [], "pci_dss_notes": "",
+                  "reviewer_summary": "Scoring failed: " + str(e)
+              })
+          with open('ci_reports/compliance_score.json', 'w') as f:
+              f.write(result)
+          PYEOF
           
           # Extract score and decision
           SCORE=$(python3 -c "
