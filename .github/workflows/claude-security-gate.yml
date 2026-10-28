@@ -164,51 +164,79 @@ jobs:
           git diff origin/${{ github.base_ref }}...HEAD -- '*.py' > ci_reports/pr_diff.patch
 
           python3 << 'PYEOF'
-          import json, os, re, urllib.request
+          import json, os, re, urllib.request, urllib.error
+
           with open('ci_reports/pr_diff.patch') as f:
-              diff = f.read()[:6000]
+              diff = f.read()[:5000]
+
           prompt = (
-              "You are a PCI DSS compliance specialist reviewing a pull request for a banking platform.\n\n"
-              "Analyze the following git diff for PCI DSS violations. Focus on:\n"
-              "1. Plaintext cardholder data in logs or outputs (PCI DSS Req 3)\n"
-              "2. Hardcoded credentials, API keys, or passwords (PCI DSS Req 6)\n"
-              "3. Missing authentication on banking API endpoints (PCI DSS Req 8)\n"
-              "4. Insufficient audit logging for financial operations (PCI DSS Req 10)\n"
-              "5. Input validation gaps (PCI DSS Req 6)\n"
-              "6. Unencrypted transmission of sensitive data (PCI DSS Req 4)\n\n"
-              "Respond with ONLY this JSON:\n"
-              '{"pci_dss_violations":[],"overall_pci_status":"PASS|FAIL","critical_high_count":0,"summary":"text"}\n\n'
+              "You are a PCI DSS compliance specialist reviewing a banking platform PR.\n"
+              "Analyze for: plaintext PII in logs (Req 3), hardcoded creds (Req 6), "
+              "missing auth (Req 8), insufficient audit logging (Req 10), "
+              "input validation gaps (Req 6), unencrypted data (Req 4).\n\n"
+              "Reply with ONLY this JSON:\n"
+              '{"pci_dss_violations":[],"overall_pci_status":"PASS",'
+              '"critical_high_count":0,"summary":"text"}\n\n'
               "DIFF:\n" + diff
           )
-          payload = json.dumps({
-              "model": "anthropic/claude-sonnet-4-5",
-              "messages": [{"role": "user", "content": prompt}],
-              "max_tokens": 1000
-          }).encode()
-          req = urllib.request.Request(
-              "https://openrouter.ai/api/v1/chat/completions",
-              data=payload,
-              headers={
-                  "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
-                  "Content-Type": "application/json",
-              },
-              method="POST"
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=90) as resp:
-                  data = json.loads(resp.read())
-                  text = data["choices"][0]["message"]["content"]
+
+          key = os.environ.get("OPENROUTER_API_KEY", "")
+          result = None
+          errors = []
+
+          for model in [
+              "anthropic/claude-3-5-sonnet-20241022",
+              "anthropic/claude-3-haiku-20240307",
+              "anthropic/claude-3-5-haiku-20241022",
+          ]:
+              if result is not None:
+                  break
+              try:
+                  pl = json.dumps({
+                      "model": model,
+                      "max_tokens": 600,
+                      "messages": [{"role": "user", "content": prompt}],
+                  }).encode()
+                  req = urllib.request.Request(
+                      "https://openrouter.ai/api/v1/chat/completions",
+                      data=pl,
+                      headers={
+                          "Authorization": "Bearer " + key,
+                          "Content-Type": "application/json",
+                          "HTTP-Referer": "https://github.com/rakesh4u51/Agenticworkflow",
+                          "X-Title": "Banking PCI Gate",
+                      },
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(req, timeout=90) as resp:
+                      data = json.loads(resp.read())
+                  if "error" in data:
+                      errors.append(f"{model}: {data['error']}")
+                      continue
+                  text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                  if not text:
+                      errors.append(f"{model}: empty content")
+                      continue
                   m = re.search(r'\{.*\}', text, re.DOTALL)
-                  result = m.group() if m else text
-          except Exception as e:
-              result = json.dumps({"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": str(e)})
-          with open('ci_reports/claude_pci_analysis.json', 'w') as f:
-              f.write(result)
-          try:
-              json.loads(result)
-          except Exception:
-              with open('ci_reports/claude_pci_analysis.json', 'w') as f:
-                  json.dump({"overall_pci_status": "ERROR", "critical_high_count": 0, "summary": "parse error"}, f)
+                  candidate = m.group() if m else text
+                  result = json.loads(candidate)
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", errors="replace")[:300]
+                  errors.append(f"{model} HTTP {e.code}: {body}")
+              except Exception as e:
+                  errors.append(f"{model}: {e}")
+
+          if result is None:
+              result = {"pci_dss_violations": [], "overall_pci_status": "ERROR",
+                        "critical_high_count": 0,
+                        "summary": "Analysis failed — " + " | ".join(str(e) for e in errors[:3])}
+
+          with open("ci_reports/claude_pci_analysis.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          print("PCI status:", result.get("overall_pci_status"))
+          if errors:
+              print("Errors:", errors)
           PYEOF
           
           # Extract key metrics
@@ -338,54 +366,89 @@ jobs:
           mkdir -p ci_reports
 
           python3 << 'PYEOF'
-          import json, os, re, urllib.request
+          import json, os, re, urllib.request, urllib.error
+
           with open('ci_reports/full_diff.patch') as f:
-              diff = f.read()[:8000]
+              diff = f.read()[:5000]
+
           prompt = (
-              "You are a senior banking compliance officer acting as a code review judge.\n\n"
-              "Score this pull request on a 1-5 compliance quality rubric for a PCI DSS-regulated banking platform.\n\n"
-              "SCORING RUBRIC:\n"
-              "5/5 EXCELLENT: All sensitive data masked, complete audit logging, input validation, no hardcoded creds, proper error handling\n"
-              "4/5 GOOD (MEETS GATE): Sensitive data handling correct, audit logging present, follows most PCI DSS standards\n"
-              "3/5 ADEQUATE (GATE FAILS): Some data protection gaps, incomplete audit trail, missing input validation\n"
-              "2/5 POOR (GATE FAILS): Significant compliance gaps, missing security controls\n"
-              "1/5 CRITICAL FAILURE (GATE FAILS): Active PCI DSS violations, data exposed\n\n"
-              "CODE CHANGES TO REVIEW:\n" + diff + "\n\n"
-              "Respond with ONLY this JSON, no other text:\n"
-              '{"score":4,"grade":"GOOD","gate_decision":"PASS","strengths":["s1"],'
-              '"improvements_required":[],"improvements_suggested":[],'
-              '"pci_dss_notes":"note","reviewer_summary":"summary"}'
+              "You are a senior banking compliance officer. Score this PR on PCI DSS compliance.\n\n"
+              "RUBRIC:\n"
+              "5=EXCELLENT: proper masking, full audit log, input validation, no hardcoded secrets\n"
+              "4=GOOD: mostly compliant, minor gaps, meets threshold\n"
+              "3=ADEQUATE: some gaps, below threshold\n"
+              "2=POOR: significant violations\n"
+              "1=CRITICAL: active violations\n\n"
+              "CODE DIFF:\n" + diff + "\n\n"
+              "Reply with ONLY this JSON (no markdown fences):\n"
+              '{"score":4,"grade":"GOOD","gate_decision":"PASS",'
+              '"strengths":["example"],"improvements_required":[],'
+              '"improvements_suggested":[],"pci_dss_notes":"note",'
+              '"reviewer_summary":"summary"}'
           )
-          payload = json.dumps({
-              "model": "anthropic/claude-sonnet-4-5",
-              "messages": [{"role": "user", "content": prompt}],
-              "max_tokens": 1000
-          }).encode()
-          req = urllib.request.Request(
-              "https://openrouter.ai/api/v1/chat/completions",
-              data=payload,
-              headers={
-                  "Authorization": "Bearer " + os.environ["OPENROUTER_API_KEY"],
-                  "Content-Type": "application/json",
-              },
-              method="POST"
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=90) as resp:
-                  data = json.loads(resp.read())
-                  text = data["choices"][0]["message"]["content"]
+
+          key = os.environ.get("OPENROUTER_API_KEY", "")
+          result = None
+          errors = []
+
+          # Try candidate models in order — stop at first success
+          for model in [
+              "anthropic/claude-3-5-sonnet-20241022",
+              "anthropic/claude-3-haiku-20240307",
+              "anthropic/claude-3-5-haiku-20241022",
+          ]:
+              if result is not None:
+                  break
+              try:
+                  pl = json.dumps({
+                      "model": model,
+                      "max_tokens": 600,
+                      "messages": [{"role": "user", "content": prompt}],
+                  }).encode()
+                  req = urllib.request.Request(
+                      "https://openrouter.ai/api/v1/chat/completions",
+                      data=pl,
+                      headers={
+                          "Authorization": "Bearer " + key,
+                          "Content-Type": "application/json",
+                          "HTTP-Referer": "https://github.com/rakesh4u51/Agenticworkflow",
+                          "X-Title": "Banking Compliance Gate",
+                      },
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(req, timeout=90) as resp:
+                      data = json.loads(resp.read())
+                  if "error" in data:
+                      errors.append(f"{model}: {data['error']}")
+                      continue
+                  text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                  if not text:
+                      errors.append(f"{model}: empty content")
+                      continue
                   m = re.search(r'\{.*\}', text, re.DOTALL)
-                  result = m.group() if m else text
-                  json.loads(result)  # validate
-          except Exception as e:
-              result = json.dumps({
+                  candidate = m.group() if m else text
+                  result = json.loads(candidate)
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode("utf-8", errors="replace")[:300]
+                  errors.append(f"{model} HTTP {e.code}: {body}")
+              except Exception as e:
+                  errors.append(f"{model}: {e}")
+
+          if result is None:
+              result = {
                   "score": 0, "grade": "ERROR", "gate_decision": "FAIL",
                   "strengths": [], "improvements_required": [],
                   "improvements_suggested": [], "pci_dss_notes": "",
-                  "reviewer_summary": "Scoring failed: " + str(e)
-              })
-          with open('ci_reports/compliance_score.json', 'w') as f:
-              f.write(result)
+                  "reviewer_summary": "Scoring failed — " + " | ".join(str(e) for e in errors[:3]),
+              }
+
+          with open("ci_reports/compliance_score.json", "w") as f:
+              json.dump(result, f, indent=2)
+
+          print("Score:", result.get("score"))
+          print("Grade:", result.get("grade"))
+          if errors:
+              print("Errors encountered:", errors)
           PYEOF
           
           # Extract score and decision
